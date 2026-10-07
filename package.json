@@ -1,0 +1,31 @@
+{
+  "name": "opencode-cache-guard",
+  "version": "0.1.0",
+  "description": "opencode keeps the Anthropic prompt cache warm between turns, asks before a prompt that would re-cache a large conversation, and shows the cache's time left beside the prompt.",
+  "type": "module",
+  "license": "MIT",
+  "exports": {
+    "./server": "./src/server.ts",
+    "./tui": "./src/tui.tsx"
+  },
+  "files": ["src"],
+  "keywords": ["opencode", "opencode-plugin", "prompt-cache", "anthropic"],
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/justmytwospence/opencode-cache-guard"
+  },
+  "scripts": {
+    "check": "npm run typecheck && npm test",
+    "typecheck": "tsc --noEmit",
+    "test": "vitest run"
+  },
+  "devDependencies": {
+    "@opencode-ai/plugin": "^1.18.0",
+    "@opentui/core": ">=0.4.5",
+    "@opentui/solid": ">=0.4.5",
+    "@types/node": "^22.20.4",
+    "solid-js": "^1.9.0",
+    "typescript": "^5.9.0",
+    "vitest": "^5.0.2"
+  }
+}
