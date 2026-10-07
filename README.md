@@ -54,6 +54,21 @@ hold.
 A resumed session gets its clock from the last reply opencode stored, so the first prompt after a
 long break is still held.
 
+**Tells herdr (TUI).** Inside a [herdr](https://herdr.dev) pane it reports the pane token `cache`
+for the session on screen: `cold 601k` (or `cold? 180k` for a guess from idle time) while the next
+prompt would re-cache at least the warning threshold, and clears it while the cache is warm or
+small, on the home screen, and when the TUI exits. Show it in herdr's agents sidebar with a custom
+token in `~/.config/herdr/config.toml`:
+
+```toml
+[ui.sidebar.agents]
+rows = [["state_icon", "workspace", { token = "$cache", fg = "#5f87d7", rules = [{ starts_with = "cold?", dim = true }] }]]
+```
+
+`src/herdr.ts` speaks herdr's socket protocol (`pane.report_metadata`, source `cache-guard`) and is
+shared verbatim with pi-cache-guard and the Codex port. `"herdr": { "enabled": false }` turns it off.
+A model switch is not visible to the TUI, so the token only reflects time.
+
 ## Install
 
 Both halves are in this package. In `opencode.jsonc`:
@@ -76,7 +91,8 @@ the plugin replaces with list prices for its estimates).
 {
   "enabled": true,
   "warn": { "enabled": true, "minCost": 0.5, "minTokens": 100000, "confirmSeconds": 120, "idleMinutes": 180 },
-  "warm": { "enabled": true, "continuationProbability": 0.15, "minSavings": 0.05, "idleMinutes": { "5m": 30, "1h": 120 } }
+  "warm": { "enabled": true, "continuationProbability": 0.15, "minSavings": 0.05, "idleMinutes": { "5m": 30, "1h": 120 } },
+  "herdr": { "enabled": true }
 }
 ```
 

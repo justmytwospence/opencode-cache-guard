@@ -166,6 +166,6 @@ describe("warmer", () => {
     expect(last.tokens).toBe(120_000);
     expect(last.ttlMs).toBeUndefined();
     expect("request" in last).toBe(false);
-    expect("price" in last).toBe(false);
+    expect(last.price).toBeUndefined(); // an unpriced provider; the TUI prices a miss from this field
   });
 });

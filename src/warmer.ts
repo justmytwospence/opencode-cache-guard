@@ -40,11 +40,12 @@ export interface SessionSnapshot {
   lastWarmCost?: number;
   /** Why warming stopped, once it has. */
   stopReason?: string;
+  /** The model's prices per million tokens, so the TUI can price a miss. */
+  price?: Price;
   updatedAt: number;
 }
 
 export interface SessionState extends SessionSnapshot {
-  price?: Price;
   request?: RecordedRequest;
   busy: boolean;
   child: boolean;
@@ -62,7 +63,7 @@ export interface WarmerDeps {
 }
 
 export function snapshotOf(state: SessionState): SessionSnapshot {
-  const { price: _price, request: _request, busy: _busy, child: _child, timer: _timer, ...snapshot } = state;
+  const { request: _request, busy: _busy, child: _child, timer: _timer, ...snapshot } = state;
   return snapshot;
 }
 

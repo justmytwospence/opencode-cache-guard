@@ -4,8 +4,9 @@
 import type { TuiPlugin, TuiPluginApi } from "@opencode-ai/plugin/tui";
 import { Show, createSignal } from "solid-js";
 
+import { HerdrReporter } from "./herdr.ts";
 import { loadSettings, stateDir } from "./settings.js";
-import { type View, readSnapshot, view } from "./status.js";
+import { type View, herdrValue, readSnapshot, view } from "./status.js";
 
 function Status(props: { api: TuiPluginApi; view: View | undefined }) {
   const theme = () => props.api.theme.current;
@@ -26,8 +27,23 @@ const tui: TuiPlugin = async (api) => {
   const dir = stateDir();
   const settings = loadSettings(api.state.path.directory || process.cwd());
   const [now, setNow] = createSignal(Date.now());
-  const ticker = setInterval(() => setNow(Date.now()), 1000);
-  api.lifecycle.onDispose(async () => clearInterval(ticker));
+  // Inside a herdr pane: the `cache` token for the session on screen, so herdr's agents sidebar
+  // lists this pane while its next prompt is doomed to a cache miss. The home screen shows no
+  // session, so the token clears there.
+  const herdr = new HerdrReporter("opencode");
+  const report = () => {
+    const route = api.route.current;
+    const shown = route.name === "session" ? String(route.params?.sessionID ?? "") : "";
+    herdr.report(shown ? herdrValue(readSnapshot(dir, shown), Date.now(), settings) : undefined);
+  };
+  const ticker = setInterval(() => {
+    setNow(Date.now());
+    report();
+  }, 1000);
+  api.lifecycle.onDispose(async () => {
+    clearInterval(ticker);
+    await herdr.clear();
+  });
   api.slots.register({
     order: 310,
     slots: {

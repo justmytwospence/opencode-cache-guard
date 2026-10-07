@@ -2,7 +2,7 @@
 import { readFileSync } from "node:fs";
 import path from "node:path";
 
-import { type Settings, formatClock } from "./core.js";
+import { type ColdReason, type Settings, formatClock, herdrCacheValue, missCost } from "./core.js";
 import type { SessionSnapshot } from "./warmer.js";
 
 export interface View {
@@ -30,4 +30,20 @@ export function readSnapshot(dir: string, sessionID: string): SessionSnapshot | 
   } catch {
     return undefined;
   }
+}
+
+/** Why the session's next request misses, from its snapshot alone (a model switch is not visible here). */
+export function coldReasonOf(snapshot: SessionSnapshot | undefined, now: number, settings: Settings): ColdReason | undefined {
+  if (!snapshot || !snapshot.lastAt || !snapshot.tokens) return undefined;
+  const idleMs = Math.max(0, now - snapshot.lastAt);
+  if (snapshot.ttlMs !== undefined) return idleMs > snapshot.ttlMs ? { kind: "expired", idleMs: idleMs - snapshot.ttlMs } : undefined;
+  return idleMs >= settings.warn.idleMinutes * 60_000 ? { kind: "idle", idleMs } : undefined;
+}
+
+/** The herdr `cache` token for the session on screen: "cold 664k" while doomed, else undefined. */
+export function herdrValue(snapshot: SessionSnapshot | undefined, now: number, settings: Settings): string | undefined {
+  const reason = coldReasonOf(snapshot, now, settings);
+  if (!reason || !snapshot) return undefined;
+  const cost = snapshot.price ? missCost(snapshot.tokens, snapshot.price, snapshot.ttlMs ?? 5 * 60_000) : undefined;
+  return herdrCacheValue(reason, snapshot.tokens, cost, settings);
 }
