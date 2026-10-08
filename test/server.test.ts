@@ -1,4 +1,4 @@
-import { mkdtempSync, readFileSync, rmSync, writeFileSync, mkdirSync } from "node:fs";
+import { existsSync, mkdtempSync, readFileSync, rmSync, writeFileSync, mkdirSync } from "node:fs";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import { afterEach, beforeEach, describe, expect, test, vi } from "vitest";
@@ -6,6 +6,7 @@ import { afterEach, beforeEach, describe, expect, test, vi } from "vitest";
 import { SESSION_HEADER, uninstall } from "../src/fetch.js";
 import { CacheGuardPlugin, coldReason, priceOf, promptText } from "../src/server.js";
 import { DEFAULT_SETTINGS } from "../src/core.js";
+import { writeConfirm, writeGuidance } from "../src/holds.js";
 import { view } from "../src/status.js";
 
 const T0 = Date.parse("2026-10-07T12:00:00Z");
@@ -22,7 +23,7 @@ let cache: string;
 
 async function plugin(messages: unknown[] = []) {
   const client = {
-    tui: { showToast: vi.fn(async () => ({ data: true })), appendPrompt: vi.fn(async () => ({ data: true })) },
+    tui: { showToast: vi.fn(async () => ({ data: true })), appendPrompt: vi.fn(async () => ({ data: true })), publish: vi.fn(async () => ({ data: true })) },
     session: { messages: vi.fn(async () => ({ data: messages })) },
   };
   const hooks = await CacheGuardPlugin({ client, directory: dir } as any);
@@ -89,10 +90,63 @@ describe("server", () => {
     expect(toast.title).toBe("Prompt cache miss");
     expect(toast.message).toContain("The prompt cache expired 10m ago: this prompt re-caches 601k tokens (~$1.38 at API prices).");
     expect(client.tui.appendPrompt).toHaveBeenCalledWith({ body: { text: "go on" } });
+    expect(client.tui.publish).toHaveBeenCalledWith({ body: { type: "tui.command.execute", properties: { command: "cache-guard.held" } } });
+    // The hold is in the state file for the TUI, with the ways through it priced.
+    const held = JSON.parse(readFileSync(path.join(cache, "opencode-cache-guard", "s.json"), "utf8")).held;
+    expect(held).toMatchObject({ text: "go on", model: { providerID: "anthropic", modelID: "claude-sonnet-5-5" }, tokens: 601_000, reason: "expired", seq: T0 + 15 * 60_000 });
+    expect(held.costs.send).toBeCloseTo(1.5025, 3);
+    expect(held.costs.compact).toBeCloseTo(1.202, 3);
     vi.setSystemTime(T0 + 16 * 60_000);
     await expect(hooks["chat.message"]!({ sessionID: "s", model: { providerID: "anthropic", modelID: "claude-sonnet-5-5" } }, prompt("go on "))).resolves.toBeUndefined();
+    // The hold cleared with the send.
+    expect(JSON.parse(readFileSync(path.join(cache, "opencode-cache-guard", "s.json"), "utf8")).held).toBeUndefined();
     // A different prompt is held again.
     await expect(hooks["chat.message"]!({ sessionID: "s", model: { providerID: "anthropic", modelID: "claude-sonnet-5-5" } }, prompt("something else"))).rejects.toThrow();
+    await hooks.dispose!();
+  });
+
+  test("the TUI's choice authorises one send through a confirm file; mute stops the holds", async () => {
+    globalThis.fetch = (async () => new Response("{}")) as unknown as typeof fetch;
+    const { hooks } = await plugin();
+    await hooks["chat.params"]!({ sessionID: "s", agent: "build", model: sonnet, provider: {}, message: {} } as any, {} as any);
+    await globalThis.fetch(URL_, { method: "POST", headers: { [SESSION_HEADER]: "s" }, body: JSON.stringify({ messages: [], tools: [{ name: "bash" }] }) });
+    await hooks.event!({ event: { type: "message.updated", properties: { info: assistant("s", T0, 600_000) } } as any });
+    vi.setSystemTime(T0 + 15 * 60_000);
+    const state = path.join(cache, "opencode-cache-guard");
+    const message = { sessionID: "s", model: { providerID: "anthropic", modelID: "claude-sonnet-5-5" } };
+    // A confirm for another text does not count, and is consumed.
+    writeConfirm(state, "s", "other");
+    await expect(hooks["chat.message"]!(message, prompt("go on"))).rejects.toThrow(/held/);
+    expect(existsSync(path.join(state, "s.confirm.json"))).toBe(false);
+    // The dialog's "Send anyway": the text is authorised once.
+    writeConfirm(state, "s", "go on");
+    await expect(hooks["chat.message"]!(message, prompt("go on"))).resolves.toBeUndefined();
+    expect(existsSync(path.join(state, "s.confirm.json"))).toBe(false);
+    await expect(hooks["chat.message"]!(message, prompt("again"))).rejects.toThrow(/held/);
+    // "Send, and stop asking in this session".
+    writeConfirm(state, "s", "again", true);
+    await expect(hooks["chat.message"]!(message, prompt("again"))).resolves.toBeUndefined();
+    await expect(hooks["chat.message"]!(message, prompt("and again"))).resolves.toBeUndefined();
+    expect(JSON.parse(readFileSync(path.join(state, "s.json"), "utf8")).muted).toBe(true);
+    await hooks.dispose!();
+  });
+
+  test("compaction guidance left by the TUI reaches the compacting hook once", async () => {
+    globalThis.fetch = (async () => new Response("{}")) as unknown as typeof fetch;
+    const { hooks } = await plugin();
+    const state = path.join(cache, "opencode-cache-guard");
+    writeGuidance(state, "s", "Keep the plan.");
+    const output = { context: [] as string[], prompt: undefined as string | undefined };
+    await hooks["experimental.session.compacting"]!({ sessionID: "s" }, output);
+    expect(output.context).toEqual(["Keep the plan."]);
+    const again = { context: [] as string[], prompt: undefined as string | undefined };
+    await hooks["experimental.session.compacting"]!({ sessionID: "s" }, again);
+    expect(again.context).toEqual([]);
+    // Stale guidance (over an hour old) is dropped.
+    writeGuidance(state, "t", "old");
+    vi.setSystemTime(T0 + 2 * 3_600_000);
+    await hooks["experimental.session.compacting"]!({ sessionID: "t" }, again);
+    expect(again.context).toEqual([]);
     await hooks.dispose!();
   });
 

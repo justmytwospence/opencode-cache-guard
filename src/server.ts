@@ -1,7 +1,8 @@
 // opencode-cache-guard (server): keeps the Anthropic prompt cache warm between turns by sending
-// the session's last request again with a one-token output cap, asks (by holding the prompt once)
-// before a prompt that would re-cache a large conversation, and leaves each session's cache clock
-// in a state file for the TUI half.
+// the session's last request again with a one-token output cap, asks before a prompt that would
+// re-cache a large conversation (it holds the prompt; the TUI half offers the choices: keep,
+// compact first, start fresh, send), and leaves each session's cache clock in a state file for the
+// TUI half.
 //
 // opencode sends Anthropic cache markers without a TTL, so the cache lives 5 minutes from each
 // request's start. src/core.ts is shared with the pi, Claude Code and Codex ports unchanged.
@@ -22,6 +23,7 @@ import {
   worthWarning,
 } from "./core.js";
 import { SESSION_HEADER, install, uninstall } from "./fetch.js";
+import { HOLD_COMMAND, confirmFile, guidanceFile, heldPrompt, takeConfirm, takeGuidance } from "./holds.js";
 import { loadSettings, stateDir } from "./settings.js";
 import { ANTHROPIC_TTL_MS, type ModelRef, type SessionSnapshot, type SessionState, Warmer, sameModel } from "./warmer.js";
 
@@ -46,8 +48,11 @@ export function priceOf(model: ModelRef, cost?: CostLike): Price | undefined {
   return model.providerID === "anthropic" ? claudePrice(model.modelID) : undefined;
 }
 
-export function ttlOf(model: ModelRef): number | undefined {
-  return model.providerID === "anthropic" ? ANTHROPIC_TTL_MS : undefined;
+export function ttlOf(model: ModelRef, env: NodeJS.ProcessEnv = process.env): number | undefined {
+  if (model.providerID !== "anthropic") return undefined;
+  // For testing: a short TTL makes a session go cold in seconds.
+  const override = Number(env.OPENCODE_CACHE_GUARD_TTL_MS);
+  return Number.isFinite(override) && override > 0 ? override : ANTHROPIC_TTL_MS;
 }
 
 /** Why the session's next request misses, if it does. */
@@ -172,9 +177,15 @@ export const CacheGuardPlugin: Plugin = async ({ client, directory }) => {
       } else if (type === "session.compacted") {
         warmer.reset(properties.sessionID);
       } else if (type === "session.deleted") {
-        warmer.sessions.delete(properties.info?.id);
-        if (properties.info?.id) rmSync(path.join(dir, `${properties.info.id}.json`), { force: true });
+        const id = properties.info?.id;
+        warmer.sessions.delete(id);
+        if (id) for (const file of [path.join(dir, `${id}.json`), confirmFile(dir, id), guidanceFile(dir, id)]) rmSync(file, { force: true });
       }
+    },
+    // Guidance the TUI left for a compaction it asked for ("Focus on this prompt", or written).
+    "experimental.session.compacting": async (input, output) => {
+      const guidance = takeGuidance(dir, input.sessionID, Date.now());
+      if (guidance) output.context.push(guidance);
     },
     "chat.message": async (input, output) => {
       settings = loadSettings(directory);
@@ -184,19 +195,35 @@ export const CacheGuardPlugin: Plugin = async ({ client, directory }) => {
       const state = warmer.sessions.get(input.sessionID)?.lastAt ? warmer.sessions.get(input.sessionID) : await restore(input.sessionID);
       if (!state?.lastAt) return;
       const now = Date.now();
+      const windowMs = settings.warn.confirmSeconds * 1000;
+      // A choice the TUI made for this text, or an earlier hold of it: this send is authorised.
+      const confirm = takeConfirm(dir, input.sessionID, text, now, windowMs);
+      if (confirm.mute) warmer.setMuted(input.sessionID, true);
+      const authorised = confirm.confirmed || memo.confirmed(input.sessionID, text, now, windowMs);
+      if (state.held) warmer.setHeld(input.sessionID, undefined);
+      if (authorised || state.muted) return;
       const reason = coldReason(state, input.model, now, settings);
       if (!reason) return;
       const next = reason.kind === "model" && input.model ? input.model : state.model;
       const price = next ? (prices.get(`${next.providerID}/${next.modelID}`) ?? priceOf(next)) : undefined;
-      const cost = price ? missCost(state.tokens, price, state.ttlMs ?? ANTHROPIC_TTL_MS) : undefined;
+      const ttlMs = state.ttlMs ?? ANTHROPIC_TTL_MS;
+      const cost = price ? missCost(state.tokens, price, ttlMs) : undefined;
       if (!worthWarning(state.tokens, cost, settings)) return;
-      if (memo.confirmed(input.sessionID, text, now, settings.warn.confirmSeconds * 1000)) return;
       memo.arm(input.sessionID, text, now);
       const minutes = Math.round(settings.warn.confirmSeconds / 60);
       const message = describeMiss(reason, state.tokens, cost);
       log(`${input.sessionID} held a prompt: ${message}`);
+      const message_ = output.message as { agent?: string; model?: { providerID: string; modelID: string; variant?: string } };
+      const model = input.model ?? (message_.model ? { providerID: message_.model.providerID, modelID: message_.model.modelID } : undefined);
+      warmer.setHeld(input.sessionID, heldPrompt({
+        text, agent: input.agent ?? message_.agent, model, variant: input.variant ?? message_.model?.variant,
+        now, line: message, reason, tokens: state.tokens, price, ttlMs,
+      }));
       // The TUI cleared its input when it sent the prompt; put the text back for the second Enter.
       await client.tui.appendPrompt({ body: { text } }).catch(() => undefined);
+      // The TUI half, when loaded, opens the choice dialog on this command; without it, the toast
+      // below says what to do.
+      await client.tui.publish({ body: { type: "tui.command.execute", properties: { command: HOLD_COMMAND } } }).catch(() => undefined);
       // The TUI shows one toast at a time and answers the failed send with a generic error toast
       // of its own; this one lands just after it and takes its place.
       setTimeout(() => {

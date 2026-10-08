@@ -11,6 +11,7 @@ import {
   warmDelayMs,
 } from "./core.js";
 import { type RecordedRequest, type ReplayUsage, parseUsage, replayRequest } from "./fetch.js";
+import type { HeldPrompt } from "./holds.js";
 
 export const ANTHROPIC_TTL_MS = 5 * 60_000;
 /** A replay counts as a hit when the cache served at least this share of the prompt. */
@@ -42,6 +43,10 @@ export interface SessionSnapshot {
   stopReason?: string;
   /** The model's prices per million tokens, so the TUI can price a miss. */
   price?: Price;
+  /** A prompt held by chat.message, until the next prompt reaches the session. */
+  held?: HeldPrompt;
+  /** The user chose to stop being asked in this session. */
+  muted?: boolean;
   updatedAt: number;
 }
 
@@ -138,6 +143,21 @@ export class Warmer {
 
   setBusy(sessionID: string, busy: boolean): void {
     this.get(sessionID).busy = busy;
+  }
+
+  /** chat.message held a prompt (or, with undefined, let one through). */
+  setHeld(sessionID: string, held: HeldPrompt | undefined): void {
+    const state = this.get(sessionID);
+    if (state.held === held) return;
+    state.held = held;
+    this.changed(state);
+  }
+
+  setMuted(sessionID: string, muted: boolean): void {
+    const state = this.get(sessionID);
+    if (!!state.muted === muted) return;
+    state.muted = muted;
+    this.changed(state);
   }
 
   /** Subagent sessions end with their parent's tool call; nobody continues them, so never warm them. */

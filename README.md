@@ -29,21 +29,40 @@ sessions. A request with budget thinking (`thinking.type: "enabled"`) is not rep
 would change the budget Anthropic keys the cache on; current Claude models use adaptive thinking.
 Only Anthropic is warmed: OpenAI publishes no cache lifetime and holds entries for hours.
 
-**Warns (server).** Before a prompt is persisted, `chat.message` checks the session's clock. When
-the cache has expired, the selected model differs from the one the conversation was cached for, or
-(providers without a TTL) the session has been idle for `warn.idleMinutes`, and the re-cache would
-cost at least `warn.minCost` ($0.50 at API list prices; `warn.minTokens` for models without
-prices), the prompt is held: a toast explains,
+**Warns (server), and offers the ways through (TUI).** Before a prompt is persisted,
+`chat.message` checks the session's clock. When the cache has expired, the selected model differs
+from the one the conversation was cached for, or (providers without a TTL) the session has been
+idle for `warn.idleMinutes`, and the re-cache would cost at least `warn.minCost` ($0.50 at API list
+prices; `warn.minTokens` for models without prices), the prompt is held: the text goes back into
+the prompt box, and the TUI half opens a dialog, Keep first so a reflexive Enter is safe:
 
 ```
-Prompt cache miss
-The prompt cache expired 10m ago: this prompt re-caches 601k tokens (~$1.38 at API prices).
-Press Enter again within 2 min to send it anyway; /compact or /new first is cheaper.
+Prompt cache miss. The prompt cache expired 10m ago: this prompt re-caches 601k tokens (~$1.38 at API prices).
+  Keep the prompt                              Leave it in the box; nothing is sent.
+  Compact first, then send (~$1.20)            Summarize the 601k-token history once, uncached, and continue on the summary.
+  Start fresh with this prompt                 A new session with the same agent and model; the history stays here.
+  Send anyway (~$1.50)                         Write the 601k-token history to the cache again.
+  Send, and stop asking in this session        Same as sending, and no more holds here.
 ```
 
-the text goes back into the prompt box, and the TUI's own "Failed to send prompt" toast names the
-hold. Sending the same text again within `warn.confirmSeconds` goes through. opencode's plugin API
-has no way to ask, so holding once is the closest thing to a confirm dialog.
+- **Compact first** asks what the summary should do: opencode's default, *Focus on this prompt*
+  (keep what the held prompt needs, drop the rest), or guidance you write. The guidance reaches
+  opencode's compaction through the `experimental.session.compacting` hook; the prompt is sent once
+  the compaction finishes. If it fails, the text stays in the box.
+- **Start fresh** creates a session with the same agent and model, moves to it and sends the prompt
+  there.
+- **Send anyway** and **Send, and stop asking** authorise the send through the server half, which
+  lets that text through once (or, muted, every prompt in the session).
+
+The costs are from `core.choiceCosts`: sending re-writes the history at the cache-write price; a
+compaction reads it once at the input price. Without the TUI half (`opencode run`, a TUI without
+the plugin), a toast says what to do, and sending the same text again within `warn.confirmSeconds`
+goes through.
+
+The server half records the hold in the session's state file (`held`) and nudges the TUI with a
+`tui.command.execute` of `cache-guard.held`, so the dialog opens at once; the TUI's 1 Hz tick is
+the fallback. The TUI answers through small files next to the state file: `<session>.confirm.json`
+(one authorised send, or mute) and `<session>.compact.json` (guidance for the next compaction).
 
 **Shows the clock (TUI).** `cache 4:12` (time left), `cache cold`, or `cache cold?` (no TTL known,
 long idle) to the right of the prompt, with `↻3` for refreshes since the last real request. The
@@ -96,7 +115,7 @@ the plugin replaces with list prices for its estimates).
 }
 ```
 
-`OPENCODE_CACHE_GUARD_WARM_DELAY_MS` overrides the refresh delay (for testing).
+`OPENCODE_CACHE_GUARD_WARM_DELAY_MS` overrides the refresh delay and `OPENCODE_CACHE_GUARD_TTL_MS` the Anthropic TTL (for testing).
 
 ## Limits
 
@@ -105,8 +124,10 @@ the plugin replaces with list prices for its estimates).
   the date rolling over in opencode's system prompt also miss, and the clock cannot see them.
 - A refresh reuses the recorded OAuth token; once the auth plugin has refreshed it (about every 8
   hours), a refresh gets 401 and warming stops until the next real request.
-- A held prompt's text is put back; attached files and images are not. The hold is a thrown error,
-  which opencode also writes to its own log as an unexpected server error.
+- A held prompt's text is put back and resent; attached files and images are not. The hold is a
+  thrown error, which opencode also writes to its own log as an unexpected server error.
+- The dialog's choices resend the prompt through the API with the held agent, model and variant,
+  not through the prompt box, so `@file` references and pasted attachments are sent as plain text.
 - Warming replays the exact request through the original `fetch`, so a proxy configured with
   `ANTHROPIC_BASE_URL` is used as well.
 
