@@ -6,7 +6,7 @@
   "license": "MIT",
   "exports": {
     "./server": "./src/server.ts",
-    "./tui": "./src/tui.tsx"
+    "./tui": "./src/tui.ts"
   },
   "files": ["src"],
   "keywords": ["opencode", "opencode-plugin", "prompt-cache", "anthropic"],
