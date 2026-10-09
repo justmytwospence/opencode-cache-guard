@@ -10,6 +10,7 @@ import { readFileSync, renameSync, rmSync, writeFileSync } from "node:fs";
 import path from "node:path";
 
 import { type ColdReason, type Price, type Settings, choiceCosts, compactionFocus, formatCost, formatTokens } from "./core.js";
+import { JEV_KEY_URL } from "./lean.js";
 
 export interface HeldPrompt {
   /** The prompt as typed (text parts only). */
@@ -59,7 +60,7 @@ export function heldPrompt(input: {
 /** The TUI command the server publishes when it holds a prompt, so the dialog opens at once. */
 export const HOLD_COMMAND = "cache-guard.held";
 
-export type Choice = "keep" | "compact" | "fresh" | "send" | "mute";
+export type Choice = "keep" | "jev" | "compact" | "fresh" | "send" | "mute";
 
 export interface ChoiceOption {
   value: Choice;
@@ -67,13 +68,25 @@ export interface ChoiceOption {
   description: string;
 }
 
-/** The dialog's options, Keep first so a reflexive Enter is safe. */
-export function choiceOptions(held: HeldPrompt): ChoiceOption[] {
+/** Under the cold-cache question while Jev is not set up (and not turned off). */
+export const JEV_TIP = `Tip: set TYPESAFE_API_KEY (${JEV_KEY_URL}) for Jev, which continues on a one-second summary for ~$0; "jev": { "enabled": false } in cache-guard.json hides this.`;
+
+/** The dialog's title: why the prompt is held, and the Jev tip when Jev is wanted but missing. */
+export function choiceTitle(held: HeldPrompt, jev: { ready: boolean; tip: boolean } = { ready: false, tip: false }): string {
+  const line = `Prompt cache miss. ${held.line}`;
+  return !jev.ready && jev.tip ? `${line}\n${JEV_TIP}` : line;
+}
+
+/** The dialog's options, Keep first so a reflexive Enter is safe; Jev's, when it is set up, before Compact first. */
+export function choiceOptions(held: HeldPrompt, jev: { ready: boolean } = { ready: false }): ChoiceOption[] {
   const size = formatTokens(held.tokens);
   const send = held.costs ? ` (~${formatCost(held.costs.send)})` : "";
   const compact = held.costs ? ` (~${formatCost(held.costs.compact)})` : "";
   return [
     { value: "keep", title: "Keep the prompt", description: "Leave it in the box; nothing is sent." },
+    ...(jev.ready
+      ? [{ value: "jev" as const, title: "Continue on Jev's summary in a new session (~1s, ~$0)", description: `Jev picks what the ${size}-token history still needs; the summary is written in code, no LLM reads the history.` }]
+      : []),
     { value: "compact", title: `Compact first, then send${compact}`, description: `Summarize the ${size}-token history once, uncached, and continue on the summary.` },
     { value: "fresh", title: "Start fresh with this prompt", description: "A new session with the same agent and model; the history stays here." },
     { value: "send", title: `Send anyway${send}`, description: `Write the ${size}-token history to the cache again.` },

@@ -1,9 +1,10 @@
 // opencode-cache-guard (server): keeps the Anthropic prompt cache warm between turns by sending
 // the session's last request again with a one-token output cap, asks before a prompt that would
 // re-cache a large conversation (it holds the prompt; the TUI half offers the choices: keep,
-// compact first, start fresh, send), and leaves each session's cache clock in a state file for the
-// TUI half. With Jev (TYPESAFE_API_KEY) it also trims large tool output before it enters the
-// context (trim.ts).
+// continue on Jev's summary, compact first, start fresh, send), and leaves each session's cache
+// clock in a state file for the TUI half. With Jev (TYPESAFE_API_KEY) it also trims large tool
+// output before it enters the context (trim.ts) and tells opencode's summarizer what must survive
+// a compaction word for word (compact.ts).
 //
 // opencode sends Anthropic cache markers without a TTL, so the cache lives 5 minutes from each
 // request's start. src/core.ts and src/lean.ts are shared with the pi, Claude Code and Codex ports
@@ -13,6 +14,7 @@ import path from "node:path";
 
 import type { Hooks, Plugin } from "@opencode-ai/plugin";
 
+import { verbatimContext } from "./compact.js";
 import {
   type ColdReason,
   ConfirmMemo,
@@ -26,7 +28,7 @@ import {
 } from "./core.js";
 import { SESSION_HEADER, install, uninstall } from "./fetch.js";
 import { HOLD_COMMAND, confirmFile, guidanceFile, heldPrompt, takeConfirm, takeGuidance } from "./holds.js";
-import { askJev } from "./jev.js";
+import { askJev, resolveJev } from "./jev.js";
 import { loadSettings, stateDir } from "./settings.js";
 import { createTrimmer } from "./trim.js";
 import type { MessageLike } from "./units.js";
@@ -222,10 +224,25 @@ export async function createServer({ client, directory }: { client: Parameters<P
       }
     },
     "tool.execute.after": async (input, output) => trimmer.afterTool(input, output),
-    // Guidance the TUI left for a compaction it asked for ("Focus on this prompt", or written).
+    // Guidance the TUI left for a compaction it asked for ("Focus on this prompt", or written), and
+    // with Jev the items that must survive word for word, judged against that guidance (else the
+    // last two requests). Any Jev failure adds nothing.
     "experimental.session.compacting": async (input, output) => {
       const guidance = takeGuidance(dir, input.sessionID, Date.now());
       if (guidance) output.context.push(guidance);
+      settings = settingsNow();
+      if (!settings.compact.filter) return;
+      const jev = resolveJev(settings, env);
+      if (jev.kind !== "ready") return;
+      const ask = (state: Record<string, unknown>, questions: Parameters<typeof askJev>[1]) =>
+        askJev(state, questions, { model: jev.target.model, timeoutMs: settings.compact.timeoutMs, apiKey: env.TYPESAFE_API_KEY, ...(extra.fetch ? { fetch: extra.fetch } : {}) });
+      const verbatim = await verbatimContext(await messagesOf(input.sessionID), guidance, settings.compact, ask);
+      if (!verbatim.ok) {
+        log(`${input.sessionID} compaction: Jev added nothing (${verbatim.reason})`);
+        return;
+      }
+      log(`${input.sessionID} compaction: Jev judged ${verbatim.units} items in ${verbatim.latencyMs} ms (${verbatim.counts.verbatim} verbatim, ${verbatim.counts.summarize} noted, ${verbatim.counts.drop} dropped)`);
+      if (verbatim.context) output.context.push(verbatim.context);
     },
     "chat.message": async (input, output) => {
       // A new prompt: a call trimmed in the last turn may be trimmed again.
