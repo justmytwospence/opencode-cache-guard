@@ -2,10 +2,12 @@
 // the session's last request again with a one-token output cap, asks before a prompt that would
 // re-cache a large conversation (it holds the prompt; the TUI half offers the choices: keep,
 // compact first, start fresh, send), and leaves each session's cache clock in a state file for the
-// TUI half.
+// TUI half. With Jev (TYPESAFE_API_KEY) it also trims large tool output before it enters the
+// context (trim.ts).
 //
 // opencode sends Anthropic cache markers without a TTL, so the cache lives 5 minutes from each
-// request's start. src/core.ts is shared with the pi, Claude Code and Codex ports unchanged.
+// request's start. src/core.ts and src/lean.ts are shared with the pi, Claude Code and Codex ports
+// unchanged.
 import { appendFileSync, mkdirSync, renameSync, rmSync, writeFileSync } from "node:fs";
 import path from "node:path";
 
@@ -24,7 +26,10 @@ import {
 } from "./core.js";
 import { SESSION_HEADER, install, uninstall } from "./fetch.js";
 import { HOLD_COMMAND, confirmFile, guidanceFile, heldPrompt, takeConfirm, takeGuidance } from "./holds.js";
+import { askJev } from "./jev.js";
 import { loadSettings, stateDir } from "./settings.js";
+import { createTrimmer } from "./trim.js";
+import type { MessageLike } from "./units.js";
 import { ANTHROPIC_TTL_MS, type ModelRef, type SessionSnapshot, type SessionState, Warmer, sameModel } from "./warmer.js";
 
 /** Agents opencode runs for itself; their requests carry no tools and are not the session's cache. */
@@ -73,9 +78,20 @@ export function promptText(parts: ReadonlyArray<{ type: string; text?: string; s
     .trim();
 }
 
-export const CacheGuardPlugin: Plugin = async ({ client, directory }) => {
-  let settings = loadSettings(directory);
-  const dir = stateDir();
+/** What the server half needs beyond opencode's input; a seam for tests. */
+export interface ServerOptions {
+  /** Jev's HTTP requests go through this (the live API otherwise). */
+  fetch?: typeof fetch;
+  env?: NodeJS.ProcessEnv;
+}
+
+export const CacheGuardPlugin: Plugin = async ({ client, directory }, options) => createServer({ client, directory }, options);
+
+export async function createServer({ client, directory }: { client: Parameters<Plugin>[0]["client"]; directory: string }, options?: Record<string, unknown>, extra: ServerOptions = {}): Promise<Hooks> {
+  const env = extra.env ?? process.env;
+  const settingsNow = () => loadSettings(directory, env, options);
+  let settings = settingsNow();
+  const dir = stateDir(env);
   mkdirSync(dir, { recursive: true });
   const log = (line: string) => {
     try {
@@ -84,6 +100,28 @@ export const CacheGuardPlugin: Plugin = async ({ client, directory }) => {
       // Logging is best effort.
     }
   };
+  /** The session's messages, as opencode stores them; empty when they cannot be read. */
+  const messagesOf = async (sessionID: string): Promise<MessageLike[]> => {
+    try {
+      const result = await client.session.messages({ path: { id: sessionID } });
+      return (result.data ?? []) as unknown as MessageLike[];
+    } catch {
+      return [];
+    }
+  };
+  // Jev: trims large tool output as it arrives. Its decisions go to opencode's log (service
+  // cache-guard, `opencode run --print-logs`) and to log.txt.
+  const trimmer = createTrimmer({
+    settings: settingsNow,
+    messages: messagesOf,
+    ask: (s) => (state, questions) => askJev(state, questions, { model: s.jev.model, timeoutMs: s.jev.timeoutMs, apiKey: env.TYPESAFE_API_KEY, ...(extra.fetch ? { fetch: extra.fetch } : {}) }),
+    log: (line) => {
+      log(`trim ${line}`);
+      void client.app.log({ body: { service: NAME, level: "info", message: line } }).catch(() => undefined);
+    },
+    toast: (message) => void client.tui.showToast({ body: { title: NAME, message, variant: "info" } }).catch(() => undefined),
+    env,
+  });
   // Tiny files, written whole so the TUI never reads half of one.
   const write = (snapshot: SessionSnapshot) => {
     const file = path.join(dir, `${snapshot.sessionID}.json`);
@@ -179,16 +217,20 @@ export const CacheGuardPlugin: Plugin = async ({ client, directory }) => {
       } else if (type === "session.deleted") {
         const id = properties.info?.id;
         warmer.sessions.delete(id);
+        trimmer.forget(id);
         if (id) for (const file of [path.join(dir, `${id}.json`), confirmFile(dir, id), guidanceFile(dir, id)]) rmSync(file, { force: true });
       }
     },
+    "tool.execute.after": async (input, output) => trimmer.afterTool(input, output),
     // Guidance the TUI left for a compaction it asked for ("Focus on this prompt", or written).
     "experimental.session.compacting": async (input, output) => {
       const guidance = takeGuidance(dir, input.sessionID, Date.now());
       if (guidance) output.context.push(guidance);
     },
     "chat.message": async (input, output) => {
-      settings = loadSettings(directory);
+      // A new prompt: a call trimmed in the last turn may be trimmed again.
+      trimmer.newTurn(input.sessionID);
+      settings = settingsNow();
       if (!settings.enabled || !settings.warn.enabled) return;
       const text = promptText(output.parts as Array<{ type: string; text?: string; synthetic?: boolean }>);
       if (!text) return;
@@ -235,6 +277,6 @@ export const CacheGuardPlugin: Plugin = async ({ client, directory }) => {
     },
   };
   return hooks;
-};
+}
 
 export default { id: `opencode-${NAME}`, server: CacheGuardPlugin };
