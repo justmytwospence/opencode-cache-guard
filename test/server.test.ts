@@ -4,10 +4,12 @@ import path from "node:path";
 import { afterEach, beforeEach, describe, expect, test, vi } from "vitest";
 
 import { SESSION_HEADER, uninstall } from "../src/fetch.js";
-import { CacheGuardPlugin, coldReason, priceOf, promptText } from "../src/server.js";
+import { VERBATIM_LEAD } from "../src/compact.js";
+import { CacheGuardPlugin, coldReason, createServer, priceOf, promptText } from "../src/server.js";
 import { DEFAULT_SETTINGS } from "../src/core.js";
 import { writeConfirm, writeGuidance } from "../src/holds.js";
 import { view } from "../src/status.js";
+import { assistant as assistantMessage, user } from "./messages.js";
 
 const T0 = Date.parse("2026-10-07T12:00:00Z");
 const URL_ = "https://api.anthropic.com/v1/messages?beta=true";
@@ -21,14 +23,41 @@ function assistant(sessionID: string, created: number, prompt: number, modelID =
 let dir: string;
 let cache: string;
 
-async function plugin(messages: unknown[] = []) {
-  const client = {
+function fakeClient(messages: unknown[] = []) {
+  return {
     tui: { showToast: vi.fn(async () => ({ data: true })), appendPrompt: vi.fn(async () => ({ data: true })), publish: vi.fn(async () => ({ data: true })) },
     session: { messages: vi.fn(async () => ({ data: messages })) },
+    app: { log: vi.fn(async () => ({ data: true })) },
   };
+}
+
+async function plugin(messages: unknown[] = []) {
+  const client = fakeClient(messages);
   const hooks = await CacheGuardPlugin({ client, directory: dir } as any);
   return { hooks, client };
 }
+
+/** The plugin with Jev answering through a fake fetch (the API's shapes), and a key in the environment. */
+async function withJev(messages: unknown[], answer: (questions: Record<string, any>, state: any) => unknown, options?: Record<string, unknown>, key = "k") {
+  const client = fakeClient(messages);
+  const sent: any[] = [];
+  const fetchImpl = (async (_url: string, init: RequestInit) => {
+    const body = JSON.parse(String(init.body));
+    sent.push(body);
+    const answers = answer(body.questions, body.state);
+    if (answers instanceof Response) return answers;
+    return new Response(JSON.stringify({ model: "jev-test", answers, usage: { input_tokens: 10 } }));
+  }) as unknown as typeof fetch;
+  const env = { ...process.env, TYPESAFE_API_KEY: key, XDG_DATA_HOME: path.join(cache, "data") };
+  const hooks = await createServer({ client: client as any, directory: dir }, options, { fetch: fetchImpl, env });
+  return { hooks, client, sent };
+}
+
+const big = Array.from({ length: 2_000 }, (_, i) => (i === 1_000 ? "Error: expected 3 retries, got 1" : `ok ${i} ${"-".repeat(10)}`)).join("\n");
+const keepErrors = (questions: Record<string, any>, state: any) =>
+  Object.fromEntries(Object.keys(questions).map((id) => [id, { type: "noul", noul: id.startsWith("block::") && String(state?.output?.[id.slice(7)] ?? "").includes("Error") ? 0.9 : 0.05 }]));
+const keepFirstVerbatim = (questions: Record<string, any>) =>
+  Object.fromEntries(Object.keys(questions).map((id) => [id, { type: "choice", choice: id === "keep::U001" ? "verbatim" : "summarize", probabilities: {}, confidence: 1 }]));
 
 const prompt = (text: string) => ({ message: { id: "u" } as any, parts: [{ type: "text", text, id: "p", sessionID: "s", messageID: "u" }] as any });
 
@@ -147,6 +176,72 @@ describe("server", () => {
     vi.setSystemTime(T0 + 2 * 3_600_000);
     await hooks["experimental.session.compacting"]!({ sessionID: "t" }, again);
     expect(again.context).toEqual([]);
+    await hooks.dispose!();
+  });
+
+  test("with Jev, large tool output is trimmed in tool.execute.after, logged under cache-guard, and toasted", async () => {
+    globalThis.fetch = (async () => new Response("{}")) as unknown as typeof fetch;
+    const history = [user("Fix the retry test"), assistantMessage(["Running the tests."])];
+    const { hooks, client, sent } = await withJev(history, keepErrors);
+    const output = { title: "npm test", output: big, metadata: {} };
+    await hooks["tool.execute.after"]!({ tool: "bash", sessionID: "s", callID: "c1", args: { command: "npm test" } }, output);
+    expect(output.output).toContain("Error: expected 3 retries, got 1");
+    expect(output.output.length).toBeLessThan(big.length / 5);
+    expect(output.output).toContain("/opencode/cache-guard/tool-output/s/c1.txt");
+    expect(sent[0].state.intent).toMatchObject({ user_request: "Fix the retry test", agent_said: "Running the tests." });
+    expect(client.app.log).toHaveBeenCalledWith({ body: { service: "cache-guard", level: "info", message: expect.stringMatching(/^bash: kept \d+ of 2000 lines/u) } });
+    expect(client.tui.showToast).toHaveBeenCalledWith({ body: { title: "cache-guard", message: expect.stringMatching(/^bash output trimmed to \d+ of 2000 lines$/u), variant: "info" } });
+    expect(readFileSync(path.join(cache, "opencode-cache-guard", "log.txt"), "utf8")).toMatch(/trim bash: kept/u);
+    // The same call again this turn is left whole; a new prompt starts a new turn (even one that is held).
+    const again = { title: "npm test", output: big, metadata: {} };
+    await hooks["tool.execute.after"]!({ tool: "bash", sessionID: "s", callID: "c2", args: { command: "npm test" } }, again);
+    expect(again.output).toBe(big);
+    await hooks["chat.message"]!({ sessionID: "s" }, prompt("next"));
+    await hooks["tool.execute.after"]!({ tool: "bash", sessionID: "s", callID: "c3", args: { command: "npm test" } }, again);
+    expect(again.output).not.toBe(big);
+    expect(sent).toHaveLength(2);
+    // Without a key nothing is asked.
+    const noKey = await withJev(history, keepErrors, undefined, "");
+    const whole = { title: "npm test", output: big, metadata: {} };
+    await noKey.hooks["tool.execute.after"]!({ tool: "bash", sessionID: "s", callID: "c1", args: {} }, whole);
+    expect(whole.output).toBe(big);
+    expect(noKey.sent).toEqual([]);
+    // Plugin options from opencode.jsonc are a settings layer.
+    const off = await withJev(history, keepErrors, { trim: { enabled: false } });
+    await off.hooks["tool.execute.after"]!({ tool: "bash", sessionID: "s", callID: "c1", args: {} }, whole);
+    expect(whole.output).toBe(big);
+    expect(off.sent).toEqual([]);
+    await hooks.dispose!();
+  });
+
+  test("with Jev, the compacting hook adds the verbatim items after the guidance; failures add nothing", async () => {
+    globalThis.fetch = (async () => new Response("{}")) as unknown as typeof fetch;
+    const history = [user("Use pnpm, never npm."), assistantMessage(["Exploring."]), user("Now add a cache.")];
+    const { hooks, sent } = await withJev(history, keepFirstVerbatim);
+    const state = path.join(cache, "opencode-cache-guard");
+    writeGuidance(state, "s", "Keep the plan.");
+    const output = { context: [] as string[], prompt: undefined as string | undefined };
+    await hooks["experimental.session.compacting"]!({ sessionID: "s" }, output);
+    expect(output.context).toEqual(["Keep the plan.", `${VERBATIM_LEAD}\n\n## Kept verbatim\n\n**User:** Use pnpm, never npm.`]);
+    expect(sent[0].state.current_goal).toBe("Keep the plan.");
+    expect(sent[0].questions["keep::U001"].type).toBe("choice");
+    // No guidance: the goal is the last two requests.
+    const plain = { context: [] as string[], prompt: undefined as string | undefined };
+    await hooks["experimental.session.compacting"]!({ sessionID: "s" }, plain);
+    expect(sent[1].state.current_goal).toBe("Use pnpm, never npm.\n---\nNow add a cache.");
+    expect(plain.context).toHaveLength(1);
+    // Jev down, filter off, or no key: only the guidance.
+    const down = await withJev(history, () => new Response("x", { status: 503 }));
+    const none = { context: [] as string[], prompt: undefined as string | undefined };
+    await down.hooks["experimental.session.compacting"]!({ sessionID: "s" }, none);
+    expect(none.context).toEqual([]);
+    const unfiltered = await withJev(history, keepFirstVerbatim, { compact: { filter: false } });
+    await unfiltered.hooks["experimental.session.compacting"]!({ sessionID: "s" }, none);
+    expect(none.context).toEqual([]);
+    expect(unfiltered.sent).toEqual([]);
+    const noKey = await withJev(history, keepFirstVerbatim, undefined, "");
+    await noKey.hooks["experimental.session.compacting"]!({ sessionID: "s" }, none);
+    expect(none.context).toEqual([]);
     await hooks.dispose!();
   });
 

@@ -4,8 +4,8 @@ import path from "node:path";
 import { afterEach, beforeEach, describe, expect, test, vi } from "vitest";
 
 import { DEFAULT_SETTINGS, mergeSettings } from "../src/core.js";
-import { GUIDANCE_OPTIONS, type HeldPrompt, choiceOptions, guidanceText, heldPrompt, shouldOffer, takeConfirm, takeGuidance, writeConfirm, writeGuidance } from "../src/holds.js";
-import { type Actions, act, offer } from "../src/tui.js";
+import { GUIDANCE_OPTIONS, type HeldPrompt, JEV_TIP, choiceOptions, choiceTitle, guidanceText, heldPrompt, shouldOffer, takeConfirm, takeGuidance, writeConfirm, writeGuidance } from "../src/holds.js";
+import { type Actions, act, jevOffer, offer } from "../src/tui.js";
 
 const T0 = Date.parse("2026-10-07T12:00:00Z");
 const sonnet = { input: 2, cacheRead: 0.2 };
@@ -29,6 +29,21 @@ describe("held prompt", () => {
     const unpriced = choiceOptions({ ...h, costs: undefined });
     expect(unpriced[3]!.title).toBe("Send anyway");
     expect(unpriced[1]!.description).toContain("601k-token history");
+  });
+
+  test("with Jev: its option sits before Compact first; without it, the title carries the tip", () => {
+    const h = held();
+    const withJev = choiceOptions(h, { ready: true });
+    expect(withJev.map((o) => o.value)).toEqual(["keep", "jev", "compact", "fresh", "send", "mute"]);
+    expect(withJev[1]!.title).toBe("Continue on Jev's summary in a new session (~1s, ~$0)");
+    expect(withJev[1]!.description).toContain("601k-token history");
+    expect(choiceTitle(h)).toBe("Prompt cache miss. The prompt cache expired 10m ago.");
+    expect(choiceTitle(h, { ready: true, tip: false })).toBe("Prompt cache miss. The prompt cache expired 10m ago.");
+    expect(choiceTitle(h, { ready: false, tip: true })).toBe(`Prompt cache miss. The prompt cache expired 10m ago.\n${JEV_TIP}`);
+    expect(JEV_TIP).toBe('Tip: set TYPESAFE_API_KEY (https://console.typesafe.ai/keys) for Jev, which continues on a one-second summary for ~$0; "jev": { "enabled": false } in cache-guard.json hides this.');
+    expect(jevOffer({ kind: "ready", target: { provider: "typesafe", model: "jev-latest" } })).toEqual({ ready: true, tip: false });
+    expect(jevOffer({ kind: "missing", reason: "TYPESAFE_API_KEY is not set" })).toEqual({ ready: false, tip: true });
+    expect(jevOffer({ kind: "off" })).toEqual({ ready: false, tip: false });
   });
 
   test("guidance: default adds nothing, focus quotes the prompt, custom is the user's text", () => {
@@ -88,6 +103,7 @@ function fakeActions(overrides: Partial<Actions> = {}) {
     create: async () => { log.push("create"); return "n1"; },
     navigate: (s) => log.push(`navigate ${s}`),
     toast: (message, variant) => log.push(`toast ${variant} ${message}`),
+    jevSummary: async (s, h) => { log.push(`jev ${s} ${h.text}`); return { ok: true, summary: "# Compacted with Jev", counts: { verbatim: 2, summarize: 1, drop: 3 }, units: 6, latencyMs: 900 }; },
     ...overrides,
   };
   return { actions, log };
@@ -119,6 +135,39 @@ describe("choices", () => {
     const failing = fakeActions({ create: async () => undefined });
     await act("fresh", "s", held(), failing.actions);
     expect(failing.log).toEqual(["toast error Creating a session failed; the prompt is still in the box."]);
+  });
+
+  test("jev summarizes, creates a session, moves there and sends the summary then the prompt; a Jev failure sends nothing", async () => {
+    const submitted: Array<{ session: string; prefix?: string; text: string }> = [];
+    const { actions, log } = fakeActions({ submit: async (s, h, prefix) => { submitted.push({ session: s, prefix, text: h.text }); log.push(`submit ${s}`); } });
+    await act("jev", "s", held(), actions);
+    expect(log).toEqual(["jev s go on", "toast info Jev kept 2 of 6 items word for word in 0.9 s; continuing in a new session.", "create", "clear", "navigate n1", "submit n1"]);
+    expect(submitted).toEqual([{ session: "n1", prefix: "# Compacted with Jev", text: "go on" }]);
+    const failing = fakeActions({ jevSummary: async () => ({ ok: false, reason: "Jev failed (timed out)" }) });
+    await act("jev", "s", held(), failing.actions);
+    expect(failing.log).toEqual(["toast error Jev could not summarize the session (Jev failed (timed out)); the prompt is still in the box."]);
+    const noSession = fakeActions({ create: async () => undefined });
+    await act("jev", "s", held(), noSession.actions);
+    expect(noSession.log.at(-1)).toBe("toast error Creating a session failed; the prompt is still in the box.");
+    expect(noSession.log).not.toContain("clear");
+  });
+
+  test("the dialog with Jev: its option runs the Jev path; the tip shows only while Jev is missing", async () => {
+    const { actions, log } = fakeActions();
+    const rendered: any[] = [];
+    const dialog = { replace: vi.fn((render: () => unknown) => rendered.push(render())), clear: vi.fn() };
+    const ui = { dialog, select: (props: any) => ({ kind: "select", ...props }), prompt: (props: any) => ({ kind: "prompt", ...props }) } as any;
+    offer(ui, "s", held(), actions, { ready: true, tip: false });
+    const first = rendered.at(-1);
+    expect(first.title).not.toContain("Tip:");
+    expect(first.options.map((o: any) => o.value)).toEqual(["keep", "jev", "compact", "fresh", "send", "mute"]);
+    first.options[1].onSelect();
+    await vi.waitFor(() => expect(log).toContain("submit n1 go on"));
+    expect(log[0]).toBe("jev s go on");
+    offer(ui, "s", held(), actions, { ready: false, tip: true });
+    const missing = rendered.at(-1);
+    expect(missing.title).toContain("Tip: set TYPESAFE_API_KEY");
+    expect(missing.options.map((o: any) => o.value)).toEqual(["keep", "compact", "fresh", "send", "mute"]);
   });
 
   test("the dialog: keep closes; compact asks for guidance; custom guidance goes through a prompt", async () => {
