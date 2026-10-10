@@ -143,7 +143,7 @@ rows = [["state_icon", "workspace", { token = "$cache", fg = "#5f87d7", rules = 
 ```
 
 `src/herdr.ts` speaks herdr's socket protocol (`pane.report_metadata`, source `cache-guard`) and is
-shared verbatim with pi-cache-guard and the Codex port. `"herdr": { "enabled": false }` turns it off.
+shared verbatim with the Codex port (pi-cache-guard goes through pi-herdr's event bus). `"herdr": { "enabled": false }` turns it off.
 A model switch is not visible to the TUI, so the token only reflects time.
 
 ## Install
